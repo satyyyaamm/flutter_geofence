@@ -6,11 +6,15 @@ import android.content.Intent
 import android.location.Location
 import android.os.Build
 import android.os.Looper
-import android.renderscript.RenderScript
 import android.util.Log
-import com.google.android.gms.location.*
-import com.google.android.gms.location.Geofence.*
-import com.google.android.gms.location.LocationRequest.PRIORITY_LOW_POWER
+import com.google.android.gms.location.Geofence
+import com.google.android.gms.location.GeofencingClient
+import com.google.android.gms.location.GeofencingRequest
+import com.google.android.gms.location.LocationCallback
+import com.google.android.gms.location.LocationRequest
+import com.google.android.gms.location.LocationResult
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
 
 
 enum class GeoEvent {
@@ -19,11 +23,11 @@ enum class GeoEvent {
 }
 
 data class GeoRegion(
-        val id: String,
-        val radius: Float,
-        val latitude: Double,
-        val longitude: Double,
-        val events: List<GeoEvent>
+    val id: String,
+    val radius: Float,
+    val latitude: Double,
+    val longitude: Double,
+    val events: List<GeoEvent>
 )
 
 fun GeoRegion.serialized(): Map<*, *> {
@@ -36,27 +40,29 @@ fun GeoRegion.serialized(): Map<*, *> {
 }
 
 fun GeoRegion.convertRegionToGeofence(): Geofence {
-    val transitionType: Int = if (events.contains(GeoEvent.entry)) {
-        GEOFENCE_TRANSITION_ENTER
-    } else {
-        GEOFENCE_TRANSITION_EXIT
+    // Support both entry and exit in transition types
+    var transitionType = 0
+    if (events.contains(GeoEvent.entry)) {
+        transitionType = transitionType or Geofence.GEOFENCE_TRANSITION_ENTER
+    }
+    if (events.contains(GeoEvent.exit)) {
+        transitionType = transitionType or Geofence.GEOFENCE_TRANSITION_EXIT
     }
 
     return Geofence.Builder()
-            .setRequestId(id)
-            .setCircularRegion(
-                    latitude,
-                    longitude,
-                    radius
-            )
-            .setExpirationDuration(NEVER_EXPIRE)
-            .setTransitionTypes(transitionType)
-            .build()
+        .setRequestId(id)
+        .setCircularRegion(latitude, longitude, radius)
+        .setExpirationDuration(Geofence.NEVER_EXPIRE)
+        .setTransitionTypes(transitionType)
+        .build()
 }
 
-class GeofenceManager(context: Context,
-                      callback: (GeoRegion) -> Unit,
-                      val locationUpdate: (Location) -> Unit, val backgroundUpdate: (Location) -> Unit) {
+class GeofenceManager(
+    private val context: Context,
+    callback: (GeoRegion) -> Unit,
+    private val locationUpdate: (Location) -> Unit,
+    private val backgroundUpdate: (Location) -> Unit
+) {
 
     private val geofencingClient: GeofencingClient = LocationServices.getGeofencingClient(context)
     private val fusedLocationClient = LocationServices.getFusedLocationProviderClient(context)
@@ -68,88 +74,118 @@ class GeofenceManager(context: Context,
     private val geofencePendingIntent: PendingIntent by lazy {
         val intent = Intent(context, GeofenceBroadcastReceiver::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            PendingIntent.getBroadcast(context, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE)
+            PendingIntent.getBroadcast(
+                context, 0, intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+            )
         } else {
             PendingIntent.getBroadcast(context, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT)
         }
     }
 
-
     fun startMonitoring(geoRegion: GeoRegion) {
-        geofencingClient.addGeofences(getGeofencingRequest(geoRegion.convertRegionToGeofence()), geofencePendingIntent)?.run {
+        geofencingClient.addGeofences(
+            getGeofencingRequest(geoRegion.convertRegionToGeofence()),
+            geofencePendingIntent
+        )?.run {
             addOnSuccessListener {
-                // Geofences added
-                Log.d("DC", "added them")
+                Log.d("GeofenceManager", "Geofence added: ${geoRegion.id}")
             }
-            addOnFailureListener {
-                // Failed to add geofences
-                Log.d("DC", "something not ok")
+            addOnFailureListener { e ->
+                Log.e("GeofenceManager", "Failed to add geofence: ${e.message}", e)
             }
         }
     }
 
     fun stopMonitoring(geoRegion: GeoRegion) {
-        val regionsToRemove = listOf(geoRegion.id)
-        geofencingClient.removeGeofences(regionsToRemove)
+        geofencingClient.removeGeofences(listOf(geoRegion.id))
+            .addOnSuccessListener {
+                Log.d("GeofenceManager", "Geofence removed: ${geoRegion.id}")
+            }
+            .addOnFailureListener { e ->
+                Log.e("GeofenceManager", "Failed to remove geofence: ${e.message}", e)
+            }
     }
 
     fun stopMonitoringAllRegions() {
         geofencingClient.removeGeofences(geofencePendingIntent)?.run {
             addOnSuccessListener {
-                // Geofences removed
+                Log.d("GeofenceManager", "All geofences removed")
             }
-            addOnFailureListener {
-                // Failed to remove geofences
+            addOnFailureListener { e ->
+                Log.e("GeofenceManager", "Failed to remove all geofences: ${e.message}", e)
             }
         }
     }
 
     private fun getGeofencingRequest(geofence: Geofence): GeofencingRequest {
-        val geofenceList = listOf(geofence)
-        return GeofencingRequest.Builder().apply {
-            setInitialTrigger(GeofencingRequest.INITIAL_TRIGGER_ENTER)
-            addGeofences(geofenceList)
-        }.build()
+        return GeofencingRequest.Builder()
+            .setInitialTrigger(GeofencingRequest.INITIAL_TRIGGER_ENTER)
+            .addGeofence(geofence)
+            .build()
     }
 
     private fun refreshLocation() {
         val locationCallback = object : LocationCallback() {
             override fun onLocationResult(locationResult: LocationResult) {
-                locationUpdate(locationResult.lastLocation)
+                val location = locationResult.lastLocation
+                if (location != null) {
+                    locationUpdate(location)
+                } else {
+                    Log.w("GeofenceManager", "refreshLocation() received null location")
+                }
             }
         }
 
-        fusedLocationClient.requestLocationUpdates(LocationRequest.create(), locationCallback, Looper.getMainLooper())
+        fusedLocationClient.requestLocationUpdates(
+            LocationRequest.create(),
+            locationCallback,
+            Looper.getMainLooper()
+        )
     }
 
     fun getUserLocation() {
-        fusedLocationClient.apply {
-            lastLocation.addOnCompleteListener {
-                it.result?.let {
-                    if (System.currentTimeMillis() - it.time > 60 * 1000) {
-                        refreshLocation()
-                    } else {
-                        locationUpdate(it)
-                    }
+        fusedLocationClient.lastLocation.addOnCompleteListener {
+            val location = it.result
+            if (location != null) {
+                if (System.currentTimeMillis() - location.time > 60 * 1000) {
+                    refreshLocation()
+                } else {
+                    locationUpdate(location)
                 }
+            } else {
+                Log.w("GeofenceManager", "lastLocation is null, refreshing...")
+                refreshLocation()
             }
         }
     }
 
     private val backgroundLocationCallback = object : LocationCallback() {
         override fun onLocationResult(locationResult: LocationResult) {
-            locationResult ?: return
-            backgroundUpdate(locationResult.lastLocation)
+            val location = locationResult.lastLocation
+            if (location != null) {
+                backgroundUpdate(location)
+            } else {
+                Log.w("GeofenceManager", "background location update received null")
+            }
         }
     }
 
     fun startListeningForLocationChanges() {
-        val request = LocationRequest().setInterval(900000L).setFastestInterval(900000L).setPriority(PRIORITY_LOW_POWER)
-        fusedLocationClient.requestLocationUpdates(request, backgroundLocationCallback, Looper.getMainLooper())
+        val request = LocationRequest.Builder(
+            900_000L // 15 min interval
+        ).setMinUpdateIntervalMillis(900_000L)
+            .setPriority(Priority.PRIORITY_LOW_POWER)
+            .build()
+
+        fusedLocationClient.requestLocationUpdates(
+            request,
+            backgroundLocationCallback,
+            Looper.getMainLooper()
+        )
     }
 
     fun stopListeningForLocationChanges() {
         fusedLocationClient.removeLocationUpdates(backgroundLocationCallback)
     }
-
 }
